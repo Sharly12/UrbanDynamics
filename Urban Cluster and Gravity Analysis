@@ -1,0 +1,580 @@
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+from shapely.geometry import Point, Polygon, box
+from sklearn.preprocessing import StandardScaler
+import contextily as ctx
+import hdbscan
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+import os
+from datetime import datetime
+
+# ==============================================
+# PART 1: Helper Functions
+# ==============================================
+
+def detect_available_cities(base_path):
+    """Automatically detects available cities by scanning both Weekday and Weekend folders."""
+    weekday_dir = os.path.join(base_path, "Weekday")
+    weekend_dir = os.path.join(base_path, "Weekend")
+    cities = set()
+
+    if os.path.exists(weekday_dir):
+        for folder in os.listdir(weekday_dir):
+            if folder.endswith("_zones_outputs"):
+                city_name = folder.replace("_zones_outputs", "")
+                cities.add(city_name)
+
+    if os.path.exists(weekend_dir):
+        for folder in os.listdir(weekend_dir):
+            if os.path.isdir(os.path.join(weekend_dir, folder)):
+                expected_csv = os.path.join(weekend_dir, folder, f"{folder}_space_time_cube.csv")
+                if os.path.exists(expected_csv):
+                    cities.add(folder)
+
+    return sorted(cities)
+
+def parse_duration(time_range):
+    """Robust time duration parser that handles HH:MM:SS format"""
+    try:
+        time_range = str(time_range).strip()
+        if '-' not in time_range:
+            return 0
+
+        start_end = time_range.split('-')
+        start_str, end_str = start_end[0].strip(), start_end[1].strip()
+
+        # Handle HH:MM:SS format
+        def parse_time(time_str):
+            parts = time_str.split(':')
+            if len(parts) == 3:  # HH:MM:SS
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            elif len(parts) == 2:  # HH:MM
+                return int(parts[0]) * 3600 + int(parts[1]) * 60
+            else:  # Unexpected format
+                return 0
+
+        start_sec = parse_time(start_str)
+        end_sec = parse_time(end_str)
+
+        if start_sec == 0 and end_sec == 0:
+            return 0
+
+        duration_min = (end_sec - start_sec) / 60
+        return max(0, duration_min)  # Ensure non-negative
+
+    except Exception as e:
+        print(f"Warning: Could not parse time range '{time_range}': {str(e)}")
+        return 0
+
+def enhanced_metrics_analysis(grid_gdf_web, centroid_gdf_web, cluster_durations, centroid_df):
+    """Calculate additional spatial, temporal and activity metrics"""
+    print("\nCalculating enhanced metrics...")
+    metrics = {}
+
+    try:
+        # Convert to UTM for accurate distance measurements
+        grid_gdf = grid_gdf_web.to_crs(epsg=32644)
+        centroid_gdf = centroid_gdf_web.to_crs(epsg=32644)
+
+        # Cluster Statistics
+        significant_clusters = cluster_durations[cluster_durations['cluster'] != 0]
+        metrics['num_significant_clusters'] = len(significant_clusters)
+
+        # Calculate activity-based significance if durations are zero
+        time_columns = [col for col in grid_gdf.columns if isinstance(col, str) and ':' in col and '-' in col]
+        activity_sums = grid_gdf[time_columns].sum(axis=0)
+
+        if len(significant_clusters) == 0 or significant_clusters['duration_hrs'].sum() == 0:
+            print("Using activity levels to determine significant clusters")
+            top_periods = activity_sums.nlargest(3)
+            metrics['top1_activity_period'] = top_periods.index[0] if len(top_periods) > 0 else None
+            metrics['top1_activity_count'] = top_periods.iloc[0] if len(top_periods) > 0 else 0
+            metrics['total_activity'] = activity_sums.sum()
+        else:
+            metrics['avg_cluster_duration_hrs'] = significant_clusters['duration_hrs'].mean()
+            metrics['max_cluster_duration_hrs'] = significant_clusters['duration_hrs'].max()
+            metrics['total_activity'] = activity_sums.sum()
+
+        # Calculate cluster areas
+        cluster_areas = []
+        for cluster_id in centroid_gdf['cluster'].unique():
+            if cluster_id == 0:
+                continue
+            cluster_points = centroid_gdf[centroid_gdf['cluster'] == cluster_id]
+            if len(cluster_points) >= 3:
+                hull = gpd.GeoSeries([p for p in cluster_points.geometry]).unary_union.convex_hull
+                cluster_areas.append({'cluster': cluster_id, 'area_km2': hull.area / 1e6})
+
+        if cluster_areas:
+            cluster_areas_df = pd.DataFrame(cluster_areas)
+            metrics['avg_cluster_area_km2'] = cluster_areas_df['area_km2'].mean()
+            metrics['total_cluster_area_km2'] = cluster_areas_df['area_km2'].sum()
+        else:
+            metrics['avg_cluster_area_km2'] = 0
+            metrics['total_cluster_area_km2'] = 0
+
+        # Gravity Center Movement
+        sorted_centroids = centroid_gdf.sort_values('time_range')
+        points = list(sorted_centroids.geometry)
+
+        # Calculate total trajectory length
+        total_distance = sum(points[i].distance(points[i+1]) for i in range(len(points)-1)) / 1000
+        metrics['total_trajectory_length_km'] = total_distance
+
+        # Calculate maximum displacement
+        if len(points) >= 2:
+            metrics['max_displacement_km'] = points[0].distance(points[-1]) / 1000
+
+        # Activity Metrics
+        metrics['peak_activity_time'] = activity_sums.idxmax()
+        metrics['peak_activity_intensity'] = activity_sums.max()
+
+        # Gini coefficient
+        all_activities = grid_gdf[time_columns].values.flatten()
+        sorted_acts = np.sort(all_activities[all_activities > 0])
+        if len(sorted_acts) > 0:
+            n = len(sorted_acts)
+            cum_acts = np.cumsum(sorted_acts)
+            gini = (n + 1 - 2 * np.sum(cum_acts) / cum_acts[-1]) / n
+            metrics['activity_gini_index'] = gini
+        else:
+            metrics['activity_gini_index'] = 0
+
+        return pd.DataFrame([metrics])
+
+    except Exception as e:
+        print(f"Error calculating enhanced metrics: {str(e)}")
+        return pd.DataFrame([{}])
+
+# ==============================================
+# PART 2: Core Analysis Functions
+# ==============================================
+
+def create_space_time_geojson(csv_path, output_dir):
+    """Convert space-time cube CSV to GeoJSON format"""
+    print(f"Loading CSV file: {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    print("Transforming to space-time cube format...")
+    pivot_df = df.pivot_table(
+        index=['cell_id', 'x_utm', 'y_utm'],
+        columns='time_range',
+        values='count',
+        fill_value=0
+    ).reset_index()
+
+    print("Creating grid geometries...")
+    spatial_bin_size = 100  # meters
+    pivot_df['geometry'] = [
+        box(x, y, x + spatial_bin_size, y + spatial_bin_size)
+        for x, y in zip(pivot_df['x_utm'], pivot_df['y_utm'])
+    ]
+
+    gdf_timecube = gpd.GeoDataFrame(pivot_df, geometry='geometry', crs='EPSG:32644')
+
+    base_name = os.path.splitext(os.path.basename(csv_path))[0]
+    geojson_path = os.path.join(output_dir, f"{base_name}_Space_Time_Cube.geojson")
+    gdf_timecube.to_file(geojson_path, driver="GeoJSON")
+    print(f"Saved Space-Time Cube GeoJSON to: {geojson_path}")
+
+    return gdf_timecube
+
+def analyze_gravity_centers(gdf_timecube):
+    """Perform urban gravity center analysis with robust time parsing"""
+    print("\nCalculating activity-weighted centroids...")
+    time_columns = [col for col in gdf_timecube.columns if isinstance(col, str) and ':' in col and '-' in col]
+    centroids = []
+
+    for t in time_columns:
+        weights = gdf_timecube[t].values
+        xs = gdf_timecube.geometry.centroid.x.values
+        ys = gdf_timecube.geometry.centroid.y.values
+        mask = weights > 0
+        if mask.sum() == 0:
+            continue
+        centroid_x = np.average(xs[mask], weights=weights[mask])
+        centroid_y = np.average(ys[mask], weights=weights[mask])
+        centroids.append({
+            'time_range': t,
+            'centroid_x': centroid_x,
+            'centroid_y': centroid_y
+        })
+
+    centroid_df = pd.DataFrame(centroids)
+
+    print("Performing clustering with HDBSCAN...")
+    coords = centroid_df[['centroid_x', 'centroid_y']].values
+    if len(coords) == 0:
+        raise ValueError("No valid centroids found for clustering")
+
+    coords_scaled = StandardScaler().fit_transform(coords)
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=4)
+    clusters = clusterer.fit_predict(coords_scaled)
+    centroid_df['cluster'] = clusters + 1
+
+    centroid_df['geometry'] = centroid_df.apply(
+        lambda row: Point(row['centroid_x'], row['centroid_y']), axis=1)
+    centroid_gdf = gpd.GeoDataFrame(centroid_df, geometry='geometry', crs='EPSG:32644')
+
+    print("Calculating cluster durations...")
+    centroid_df['duration_min'] = centroid_df['time_range'].apply(parse_duration)
+
+    # Calculate cluster durations
+    cluster_durations = centroid_df.groupby('cluster')['duration_min'].sum().reset_index()
+    cluster_durations['duration_hrs'] = cluster_durations['duration_min'] / 60
+    cluster_durations['duration_label'] = cluster_durations.apply(
+        lambda x: f"{int(x['duration_hrs'])}h {int(x['duration_min'] % 60)}m" if x['cluster'] != 0 else "Noise",
+        axis=1
+    )
+
+    print("\nCluster Duration Summary:")
+    print("-----------------------")
+    if len(cluster_durations[cluster_durations['cluster'] != 0]) > 0:
+        for _, row in cluster_durations.iterrows():
+            if row['cluster'] != 0:
+                print(f"Cluster {row['cluster']}: {row['duration_label']} ({row['duration_hrs']:.1f} hours)")
+    else:
+        print("No clusters with valid duration data")
+
+        # Fallback: Calculate activity-based significance
+        activity_sums = gdf_timecube[time_columns].sum(axis=0)
+        top_time_periods = activity_sums.nlargest(3)
+        print("\nTop 3 Active Time Periods (counts):")
+        for time, count in top_time_periods.items():
+            print(f"{time}: {count:.0f} activities")
+
+    if len(cluster_durations[cluster_durations['cluster'] != 0]) > 0:
+        total_duration = cluster_durations[cluster_durations['cluster'] != 0]['duration_min'].sum()
+        cluster_durations['percentage'] = (cluster_durations['duration_min'] / total_duration) * 100
+
+        print("\nCluster Time Distribution:")
+        print("-------------------------")
+        for _, row in cluster_durations.iterrows():
+            if row['cluster'] != 0:
+                print(f"Cluster {row['cluster']}: {row['percentage']:.1f}% of total time")
+    else:
+        cluster_durations['percentage'] = 0
+        print("\nNo valid clusters for time distribution")
+
+    grid_gdf_web = gdf_timecube.to_crs(epsg=3857)
+    centroid_gdf_web = centroid_gdf.to_crs(epsg=3857)
+
+    return grid_gdf_web, centroid_gdf_web, cluster_durations, clusterer, centroid_df
+
+def visualize_spatial_results(grid_gdf_web, centroid_gdf_web, cluster_durations, clusterer):
+    """Create visualization of the spatial analysis results"""
+    print("\nGenerating spatial visualization...")
+    fig, ax = plt.subplots(figsize=(30, 20))
+
+    cluster_labels = sorted(centroid_gdf_web['cluster'].unique())
+    cmap = plt.colormaps.get_cmap("tab20")
+    cluster_colors = {cid: cmap(i % 20) for i, cid in enumerate(cluster_labels) if cid != 0}
+    cluster_colors[0] = "gray"
+
+    grid_gdf_web.plot(ax=ax, color='none', edgecolor='darkblue', linewidth=1.0, alpha=0.3,
+                     label='Functional Boundary', hatch='////', zorder=1)
+
+    for cluster_id in cluster_labels:
+        if cluster_id == 0:
+            continue
+
+        cluster_data = centroid_gdf_web[centroid_gdf_web['cluster'] == cluster_id]
+
+        if len(cluster_data) > 2:
+            points = np.array([[geom.x, geom.y] for geom in cluster_data.geometry])
+            hull = gpd.GeoSeries([Point(xy) for xy in points]).unary_union.convex_hull
+
+            gpd.GeoSeries(hull).plot(ax=ax, color=cluster_colors[cluster_id],
+                                    alpha=0.5, edgecolor='none', zorder=3)
+
+            gpd.GeoSeries(hull).boundary.plot(ax=ax, color=cluster_colors[cluster_id],
+                                             linewidth=3, linestyle='-', zorder=4)
+
+    for cluster_id in cluster_labels:
+        cluster_data = centroid_gdf_web[centroid_gdf_web['cluster'] == cluster_id]
+        color = cluster_colors[cluster_id]
+
+        cluster_data.plot(
+            ax=ax,
+            marker='o',
+            markersize=80,
+            alpha=0.9,
+            edgecolor='white',
+            linewidth=1.5,
+            label=f"Cluster {cluster_id}",
+            color=color,
+            zorder=5
+        )
+
+    sorted_gdf = centroid_gdf_web.sort_values('time_range')
+    ax.plot(sorted_gdf.geometry.x, sorted_gdf.geometry.y,
+            color='black', linewidth=1, alpha=0.8, linestyle='-')
+
+    for i, row in sorted_gdf.iterrows():
+        ax.text(row.geometry.x, row.geometry.y, row['time_range'][:5],
+               fontsize=7, ha='center', va='center', rotation=45)
+
+    start = sorted_gdf.iloc[0]
+    end = sorted_gdf.iloc[-1]
+    ax.scatter(start.geometry.x, start.geometry.y, color='green', s=100, zorder=6)
+    ax.text(start.geometry.x, start.geometry.y, " Start", fontsize=12,
+           ha='left', va='center', color='green')
+    ax.scatter(end.geometry.x, end.geometry.y, color='red', s=100, zorder=6)
+    ax.text(end.geometry.x, end.geometry.y, " End", fontsize=12,
+           ha='left', va='center', color='red')
+
+    print("Adding basemap...")
+    ctx.add_basemap(ax, crs=centroid_gdf_web.crs, source=ctx.providers.OpenStreetMap.Mapnik)
+
+    def get_cluster_label(cid):
+        if cid == 0:
+            return "Noise"
+        if (cid in cluster_durations['cluster'].values and
+            cluster_durations[cluster_durations['cluster']==cid]['duration_min'].values[0] > 0):
+            return f"Cluster {cid} ({cluster_durations[cluster_durations['cluster']==cid]['duration_label'].values[0]})"
+        return f"Cluster {cid}"
+
+    legend_elements = [
+        Patch(facecolor='none', edgecolor='darkblue', hatch='////', label='Functional Boundary', alpha=0.4),
+        Line2D([0], [0], marker='o', color='green', label='Start Point', markersize=15, linestyle='None'),
+        Line2D([0], [0], marker='o', color='red', label='End Point', markersize=15, linestyle='None'),
+        *[Patch(facecolor=cluster_colors[cid], alpha=0.7, label=get_cluster_label(cid))
+          for cid in cluster_labels if cid != 0],
+        *([] if 0 not in cluster_labels else [Patch(facecolor='gray', label='Noise')])
+    ]
+
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=14, title='Legend', title_fontsize=16)
+    ax.set_title("Urban Gravity Center Analysis with Cluster Duration", fontsize=18, pad=20)
+    ax.set_axis_off()
+    plt.tight_layout()
+
+    return fig, cluster_colors
+
+def analyze_trajectory_patterns(centroid_df, cluster_colors):
+    """Analyze and visualize simplified trajectory patterns"""
+    print("\nAnalyzing temporal trajectory patterns...")
+
+    centroid_df['datetime'] = pd.to_datetime(
+        centroid_df['time_range'].str.split('-').str[0],
+        format='%H:%M:%S',
+        errors='coerce'
+    )
+
+    if centroid_df['datetime'].isna().any():
+        print("Alternative time parsing...")
+        try:
+            centroid_df['hour'] = centroid_df['time_range'].str.extract(r'(\d{1,2}):').astype(float)
+        except:
+            print("Warning: Could not reliably parse time information")
+            return None
+
+    if 'datetime' in centroid_df.columns and not centroid_df['datetime'].isna().all():
+        centroid_df['hour'] = centroid_df['datetime'].dt.hour + centroid_df['datetime'].dt.minute/60
+    elif 'hour' not in centroid_df.columns:
+        print("Warning: No time information available for trajectory analysis")
+        return None
+
+    centroid_df['time_period'] = pd.cut(
+        centroid_df['hour'],
+        bins=[0, 6, 12, 18, 24],
+        labels=['Night', 'Morning', 'Afternoon', 'Evening'],
+        right=False
+    )
+
+    dominant_clusters = centroid_df.groupby('time_period')['cluster'].agg(
+        lambda x: x.mode()[0] if not x.mode().empty else None
+    ).reset_index()
+
+    period_hours = {'Night': 3, 'Morning': 9, 'Afternoon': 15, 'Evening': 21}
+    dominant_clusters['hour'] = dominant_clusters['time_period'].map(period_hours)
+
+    print("\nSimplified Trajectory Summary:")
+    print("---------------------------")
+    for i in range(len(dominant_clusters)-1):
+        current = dominant_clusters.iloc[i]
+        next_ = dominant_clusters.iloc[i+1]
+        current_label = "Noise" if current['cluster'] == 0 else f"Cluster {current['cluster']}"
+        next_label = "Noise" if next_['cluster'] == 0 else f"Cluster {next_['cluster']}"
+        print(f"During {current['time_period']} (∼{current['hour']}:00), "
+              f"the center is mostly in {current_label}, "
+              f"then moves to {next_label} in {next_['time_period']}.")
+
+    trajectory = ["Noise" if x == 0 else f"Cluster {x}" for x in dominant_clusters['cluster'].tolist()]
+    print("\nBasic Center Trajectory:", " → ".join(trajectory))
+
+    print("Creating trajectory plot...")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    unique_clusters = sorted(centroid_df['cluster'].unique())
+
+    for cluster in unique_clusters:
+        cluster_data = centroid_df[centroid_df['cluster'] == cluster]
+        color = cluster_colors.get(cluster, "gray")
+        label = f"Cluster {cluster}" if cluster != 0 else "Noise"
+        ax.scatter(
+            cluster_data['hour'],
+            cluster_data['cluster'],
+            color=color,
+            s=50,
+            alpha=0.7,
+            label=label
+        )
+
+    ax.plot(
+        dominant_clusters['hour'],
+        dominant_clusters['cluster'],
+        color='black',
+        linestyle='--',
+        marker='o',
+        markersize=8,
+        label='Dominant Trajectory'
+    )
+
+    ax.set_title('Simplified Center Trajectory Pattern', fontsize=14)
+    ax.set_xlabel('Time of Day (Hour)', fontsize=12)
+    ax.set_ylabel('Cluster', fontsize=12)
+    ax.set_xticks([0, 6, 12, 18, 24])
+    ax.set_xticklabels(['12AM', '6AM', '12PM', '6PM', '12AM'])
+
+    y_ticks = unique_clusters
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels([f"Cluster {x}" if x != 0 else "Noise" for x in y_ticks])
+
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+
+    return fig
+
+# ==============================================
+# PART 3: Main Processing Pipeline
+# ==============================================
+
+def process_city_analysis(base_path, output_root):
+    """Process analysis for all automatically detected cities"""
+    cities = detect_available_cities(base_path)
+    if not cities:
+        raise ValueError("No cities found. Check your folder structure!")
+
+    print(f"Detected cities to process: {', '.join(cities)}")
+    results = []
+    os.makedirs(output_root, exist_ok=True)
+
+    for city in cities:
+        print(f"\n{'='*40}")
+        print(f"PROCESSING CITY: {city.upper()}")
+        print(f"{'='*40}")
+
+        city_output_dir = os.path.join(output_root, city)
+        os.makedirs(city_output_dir, exist_ok=True)
+
+        weekday_path = os.path.join(base_path, "Weekday", f"{city}_zones_outputs", f"{city}_zones_space_time_cube.csv")
+        weekend_path = os.path.join(base_path, "Weekend", city, f"{city}_space_time_cube.csv")
+
+        for day_type, csv_path in [('Weekday', weekday_path), ('Weekend', weekend_path)]:
+            if not os.path.exists(csv_path):
+                print(f"⚠️ File not found, skipping: {csv_path}")
+                continue
+
+            print(f"\nProcessing {day_type} data for {city}")
+            print(f"Input file: {csv_path}")
+
+            try:
+                day_output_dir = os.path.join(city_output_dir, day_type)
+                os.makedirs(day_output_dir, exist_ok=True)
+
+                gdf_timecube = create_space_time_geojson(csv_path, day_output_dir)
+                grid_gdf, centroid_gdf, durations, clusterer, centroid_df = analyze_gravity_centers(gdf_timecube)
+                spatial_fig, cluster_colors = visualize_spatial_results(grid_gdf, centroid_gdf, durations, clusterer)
+                trajectory_fig = analyze_trajectory_patterns(centroid_df, cluster_colors)
+
+                base_name = f"{city}_{day_type}_analysis"
+                spatial_output = os.path.join(day_output_dir, f"{base_name}_spatial.png")
+                spatial_fig.savefig(spatial_output, dpi=300, bbox_inches='tight')
+                plt.close(spatial_fig)
+
+                if trajectory_fig:
+                    traj_output = os.path.join(day_output_dir, f"{base_name}_trajectory.png")
+                    trajectory_fig.savefig(traj_output, dpi=300, bbox_inches='tight')
+                    plt.close(trajectory_fig)
+
+                duration_output = os.path.join(day_output_dir, f"{base_name}_durations.csv")
+                durations.to_csv(duration_output, index=False)
+
+                # Calculate and save enhanced metrics
+                metrics_df = enhanced_metrics_analysis(grid_gdf, centroid_gdf, durations, centroid_df)
+                metrics_output = os.path.join(day_output_dir, f"{base_name}_metrics.csv")
+                metrics_df.to_csv(metrics_output, index=False)
+
+                results.append({
+                    'city': city,
+                    'day_type': day_type,
+                    'spatial_output': spatial_output,
+                    'trajectory_output': traj_output if trajectory_fig else None,
+                    'duration_output': duration_output,
+                    'metrics_output': metrics_output,
+                    'cluster_count': len(durations[durations['cluster'] != 0]),
+                    'total_duration_hrs': durations[durations['cluster'] != 0]['duration_hrs'].sum() if len(durations[durations['cluster'] != 0]) > 0 else 0
+                })
+
+                print(f"✅ Successfully processed {day_type} data for {city}")
+
+            except Exception as e:
+                print(f"❌ Error processing {city} {day_type}: {str(e)}")
+                continue
+
+    return pd.DataFrame(results)
+
+# ==============================================
+# MAIN EXECUTION
+# ==============================================
+
+if __name__ == "__main__":
+    # Configure paths
+    base_path = 'stc file location'
+    output_root = 'output file location'
+
+    # Verify Google Drive is mounted
+    if not os.path.exists('/content/drive'):
+        from google.colab import drive
+        drive.mount('/content/drive')
+
+    # Verify base path exists
+    if not os.path.exists(base_path):
+        raise FileNotFoundError(f"Base directory not found: {base_path}")
+
+    # Get list of cities
+    cities = detect_available_cities(base_path)
+    print(f"Cities to process: {cities}")
+
+    # Process one city at a time with error handling
+    for city in cities:
+        try:
+            print(f"\n{'='*40}")
+            print(f"STARTING PROCESSING FOR: {city.upper()}")
+            print(f"{'='*40}")
+
+            city_output_dir = os.path.join(output_root, city)
+            os.makedirs(city_output_dir, exist_ok=True)
+
+            # Check if already processed
+            summary_file = os.path.join(city_output_dir, f"{city}_summary.csv")
+            if os.path.exists(summary_file):
+                print(f"Skipping {city} - already processed")
+                continue
+
+            # Process this city
+            results_df = process_city_analysis(base_path, output_root)
+
+            # Save city-specific summary
+            if not results_df.empty:
+                results_df.to_csv(summary_file, index=False)
+                print(f"Saved {city} results to {summary_file}")
+
+        except Exception as e:
+            print(f"\n❌ Error processing {city}: {str(e)}")
+            continue
+
+    print("\n✅ All cities processed!")
