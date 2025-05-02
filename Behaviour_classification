@@ -1,0 +1,288 @@
+# ============================================
+# Step 1: Import Libraries
+# ============================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ============================================
+# Step 2: Load the Data
+# ============================================
+# Paths to your uploaded CSVs
+spatial_temporal_csv = "UrbanPulse Metrics CSV location"
+temporal_pulse_csv = "Urban Cluster and Gravity CSV file location"
+
+# Read both CSVs
+spatial_df = pd.read_csv(spatial_temporal_csv)
+temporal_df = pd.read_csv(temporal_pulse_csv)
+
+# ============================================
+# Step 3: Clean and Align Columns
+# ============================================
+# Fix column names if needed
+spatial_df.rename(columns={'City': 'city', 'Day_Type': 'day_type'}, inplace=True)
+temporal_df.rename(columns={'City': 'city', 'Day_Type': 'day_type'}, inplace=True)
+
+# Clean city names
+spatial_df['city'] = spatial_df['city'].str.strip()
+temporal_df['city'] = temporal_df['city'].str.strip()
+
+# Clean day_type if needed
+spatial_df['day_type'] = spatial_df['day_type'].str.strip().str.lower()
+temporal_df['day_type'] = temporal_df['day_type'].str.strip().str.lower()
+
+# ============================================
+# Step 4: Merge the Datasets
+# ============================================
+# Merge based on city and day_type
+merged_df = pd.merge(spatial_df, temporal_df, on=['city', 'day_type'], how='inner')
+
+print(f"✅ Total rows after merge: {merged_df.shape[0]} cities")
+merged_df.to_csv("/content/merged_city_metrics.csv", index=False)
+
+# ============================================
+# Step 5: Convert peak_time to Numerical Minutes
+# ============================================
+def convert_peak_time_to_minutes(peak_time_str):
+    try:
+        if pd.isna(peak_time_str):
+            return np.nan
+        t = pd.to_datetime(peak_time_str, format="%H:%M")
+        return t.hour * 60 + t.minute
+    except:
+        return np.nan
+
+merged_df['peak_time_minutes'] = merged_df['peak_time'].apply(convert_peak_time_to_minutes)
+
+# ============================================
+# Step 6: Prepare Data for Correlation
+# ============================================
+# Select only numeric features (drop non-numeric)
+feature_df = merged_df.select_dtypes(include=[np.number])
+
+print(f"✅ Total numeric features for correlation: {feature_df.shape[1]}")
+
+# ============================================
+# Step 7: Compute Correlations
+# ============================================
+# Pearson (linear)
+pearson_corr = feature_df.corr(method='pearson')
+
+# Spearman (nonlinear)
+spearman_corr = feature_df.corr(method='spearman')
+
+# Save correlation matrices
+pearson_corr.to_csv("/content/pearson_correlation_matrix.csv")
+spearman_corr.to_csv("/content/spearman_correlation_matrix.csv")
+
+# ============================================
+# Step 8: Visualize Heatmaps
+# ============================================
+# Pearson Heatmap
+plt.figure(figsize=(20, 16))
+sns.heatmap(pearson_corr, cmap='coolwarm', center=0, annot=False)
+plt.title("📈 Pearson Correlation Heatmap (Linear Relationships)", fontsize=18)
+plt.tight_layout()
+plt.savefig("/content/pearson_correlation_heatmap.png", dpi=300)
+plt.close()
+
+# Spearman Heatmap
+plt.figure(figsize=(20, 16))
+sns.heatmap(spearman_corr, cmap='coolwarm', center=0, annot=False)
+plt.title("🔀 Spearman Correlation Heatmap (Monotonic Relationships)", fontsize=18)
+plt.tight_layout()
+plt.savefig("/content/spearman_correlation_heatmap.png", dpi=300)
+plt.close()
+
+print("\n🎯 Correlation analysis completed!")
+print("- Pearson and Spearman matrices saved")
+print("- Heatmaps generated")
+
+#tresholdong 
+
+# ============================================
+# Step 0: Check available columns
+# ============================================
+import pandas as pd
+import numpy as np
+
+# Load dataset
+merged_df = pd.read_csv("/content/drive/MyDrive/city_correlation/merged_city_metrics.csv")
+
+print(f"✅ Dataset Loaded: {merged_df.shape[0]} rows, {merged_df.shape[1]} columns")
+print("\nAvailable Columns:")
+print(merged_df.columns.tolist())   # <-- Add this line
+
+# ============================================
+# Step 1: Select key metrics for thresholding
+# ============================================
+key_metrics = [
+    'total_activity_x',  # We want this
+    'activity_gini_index',
+    'num_significant_clusters',
+    'avg_cluster_duration_hrs',
+    'max_cluster_duration_hrs',
+    'avg_cluster_area_km2',
+    'total_cluster_area_km2',
+    'total_trajectory_length_km',
+    'max_displacement_km',
+    'num_change_points',
+    'num_segments',
+    'num_peaks',
+    'num_rebounds',
+    'cv',
+    'peak_duration',
+    'am_pm_ratio'
+]
+
+# Only use available ones
+available_metrics = [metric for metric in key_metrics if metric in merged_df.columns]
+
+print(f"\n✅ Found {len(available_metrics)} metrics available for thresholding:")
+print(available_metrics)
+
+# ============================================
+# Step 2: Calculate Percentiles
+# ============================================
+thresholds = {}
+
+for metric in available_metrics:
+    thresholds[metric] = {
+        '25%': merged_df[metric].quantile(0.25),
+        '50%': merged_df[metric].quantile(0.50),
+        '75%': merged_df[metric].quantile(0.75)
+    }
+
+thresholds_df = pd.DataFrame(thresholds).T
+thresholds_df.index.name = "Metric"
+
+thresholds_df.to_csv("/content/drive/MyDrive/city_correlation/outputs/metric_thresholds_summary.csv")
+
+print("\n✅ Thresholds calculated and saved as 'metric_thresholds_summary.csv'")
+print("\nThreshold Summary:")
+print(thresholds_df)
+
+#Classification 
+# ============================================
+# Step 0: Import libraries
+# ============================================
+import pandas as pd
+
+# ============================================
+# Step 1: Load dataset and thresholds
+# ============================================
+merged_df = pd.read_csv("/content/drive/MyDrive/city_correlation/merged_city_metrics.csv")
+thresholds_df = pd.read_csv("/content/drive/MyDrive/city_correlation/outputs/metric_thresholds_summary.csv", index_col=0)
+
+print(f"✅ Dataset Loaded: {merged_df.shape[0]} cities")
+
+# ============================================
+# Step 2: Define thresholds dictionary
+# ============================================
+thresholds = thresholds_df.to_dict(orient='index')
+
+# Helper function to check if a metric is HIGH, MEDIUM, LOW
+def check_level(value, metric):
+    if metric not in thresholds:
+        return None
+    if value <= thresholds[metric]['25%']:
+        return "low"
+    elif value >= thresholds[metric]['75%']:
+        return "high"
+    else:
+        return "moderate"
+
+# ============================================
+# Step 3: Define Typology Conditions
+# ============================================
+def evaluate_typologies(city_row):
+    scores = {}
+
+    # Type 1: Rhythmic Polycentric
+    score = 0
+    score += (check_level(city_row['total_activity_x'], 'total_activity_x') == "moderate")
+    score += (check_level(city_row['num_segments'], 'num_segments') == "moderate")
+    score += (check_level(city_row['num_change_points'], 'num_change_points') == "moderate")
+    score += (check_level(city_row['num_peaks'], 'num_peaks') == "low")
+    score += (check_level(city_row['cv'], 'cv') == "low")
+    score += (check_level(city_row['num_rebounds'], 'num_rebounds') == "low")
+    scores['Type 1: Rhythmic Polycentric'] = score / 6
+
+    # Type 2: Hyperdynamic Nodes
+    score = 0
+    score += (check_level(city_row['num_change_points'], 'num_change_points') == "high")
+    score += (check_level(city_row['num_peaks'], 'num_peaks') == "high")
+    score += (check_level(city_row['num_rebounds'], 'num_rebounds') == "high")
+    score += (check_level(city_row['cv'], 'cv') == "high")
+    score += (check_level(city_row['total_trajectory_length_km'], 'total_trajectory_length_km') == "high")
+    score += (check_level(city_row['avg_cluster_area_km2'], 'avg_cluster_area_km2') == "low")
+    score += (check_level(city_row['avg_cluster_duration_hrs'], 'avg_cluster_duration_hrs') == "low")
+    scores['Type 2: Hyperdynamic Nodes'] = score / 7
+
+    # Type 3: Stable Compact Monocentric
+    score = 0
+    score += (check_level(city_row['activity_gini_index'], 'activity_gini_index') == "high")
+    score += (check_level(city_row['num_segments'], 'num_segments') == "low")
+    score += (check_level(city_row['num_change_points'], 'num_change_points') == "low")
+    score += (check_level(city_row['total_trajectory_length_km'], 'total_trajectory_length_km') == "low")
+    scores['Type 3: Stable Compact Monocentric'] = score / 4
+
+    # Type 4: Dispersed Suburbanizing Fields
+    score = 0
+    score += (check_level(city_row['avg_cluster_area_km2'], 'avg_cluster_area_km2') == "high")
+    score += (check_level(city_row['activity_gini_index'], 'activity_gini_index') == "low")
+    score += (check_level(city_row['num_peaks'], 'num_peaks') == "low")
+    score += (check_level(city_row['num_rebounds'], 'num_rebounds') == "low")
+    score += (check_level(city_row['total_activity_x'], 'total_activity_x') == "low")
+    scores['Type 4: Dispersed Suburbanizing Fields'] = score / 5
+
+    # Type 5: Pulsing Dense Urban Cores
+    score = 0
+    score += (check_level(city_row['num_peaks'], 'num_peaks') == "high")
+    score += (check_level(city_row['num_rebounds'], 'num_rebounds') == "high")
+    score += (check_level(city_row['activity_gini_index'], 'activity_gini_index') == "high")
+    score += (check_level(city_row['total_trajectory_length_km'], 'total_trajectory_length_km') in ["moderate", "high"])
+    scores['Type 5: Pulsing Dense Urban Cores'] = score / 4
+
+    return scores
+
+# ============================================
+# Step 4: Apply Typology Scoring
+# ============================================
+city_typologies = []
+
+for idx, city in merged_df.iterrows():
+    scores = evaluate_typologies(city)
+    primary_typology = max(scores, key=scores.get)
+    secondary_typology = None
+
+    # If second best is reasonably close (> 70% of primary)
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if len(sorted_scores) > 1 and sorted_scores[1][1] >= 0.7 * sorted_scores[0][1]:
+        secondary_typology = sorted_scores[1][0]
+
+    if secondary_typology:
+        final_typology = f"{primary_typology} - {secondary_typology}"
+    else:
+        final_typology = primary_typology
+
+    city_typologies.append(final_typology)
+
+merged_df['typology'] = city_typologies
+
+# ============================================
+# Step 5: Save Results
+# ============================================
+merged_df[['city', 'day_type', 'typology']].to_csv("/content/drive/MyDrive/city_correlation/final_city_typologies_with_minor_traits.csv", index=False)
+
+print("\n✅ Dominant + Minor Trait Typology Assignment Completed!")
+print("\n✅ Final classified cities saved at 'final_city_typologies_with_minor_traits.csv'")
+
+# ============================================
+# Step 6: Summary Report
+# ============================================
+summary = merged_df['typology'].value_counts()
+print("\n🔎 Typology Distribution Summary:")
+print(summary)
+
