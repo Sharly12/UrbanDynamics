@@ -1,0 +1,274 @@
+import os
+import geopandas as gpd
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.signal import savgol_filter
+
+# --- Configuration ---
+config = {
+    # File paths
+    'shapefiles_folder': r"functional_boundary shp file location",  # Folder containing your shapefiles
+    'csv_path': r"filtered Mobile positioning data file location ",
+    'output_base_folder': r"output directory file location",  # Base folder for all outputs
+    
+    # Analysis parameters
+    'target_zone': 'core',
+    'spatial_bin_size': 100,  # meters
+    'temporal_bin_size': 15,  # minutes
+    'smoothing_window': 5,    # must be odd
+    'smoothing_polyorder': 2,
+    
+    # Visualization settings
+    'dpi': 300,
+    'figure_size': (15, 6),
+    'space_time_cube_figsize': (14, 10),
+    'colormap': 'viridis',
+    'base_point_size': 8,
+    'min_alpha': 0.3,
+    'max_alpha': 0.8,
+    'edge_color': 'black',
+    'edge_width': 0.2,
+    'legend_counts': [1, 10, 100, 1000]  # For size legend
+}
+
+# --- Get list of shapefiles ---
+shapefiles = [f for f in os.listdir(config['shapefiles_folder']) if f.endswith('.shp')]
+print(f"Found {len(shapefiles)} shapefiles to process:")
+for shp in shapefiles:
+    print(f" - {shp}")
+
+# --- Process each shapefile ---
+for shapefile in shapefiles:
+    shapefile_name = os.path.splitext(shapefile)[0]  # Remove .shp extension
+    print(f"\n{'='*50}\nProcessing shapefile: {shapefile_name}\n{'='*50}")
+    
+    # Create output folder for this shapefile
+    output_folder = os.path.join(config['output_base_folder'], f"{shapefile_name}_outputs")
+    os.makedirs(output_folder, exist_ok=True)
+    print(f"Output will be saved to: {output_folder}")
+    
+    # --- 1. Load and prepare spatial data ---
+    print("\n1. Loading shapefile...")
+    shapefile_path = os.path.join(config['shapefiles_folder'], shapefile)
+    gdf = gpd.read_file(shapefile_path).to_crs("EPSG:32644")
+    core_gdf = gdf[gdf['zone'] == config['target_zone']]
+    print(f" - Found {len(core_gdf)} '{config['target_zone']}' zones. Bounds: {core_gdf.total_bounds}")
+
+    # --- 2. Process movement data ---
+    print("\n2. Loading and filtering CSV data in chunks...")
+    chunksize = 1000000
+    required_columns = ['datetime', 'lon_pred', 'lat_pred', 'utm_e', 'utm_n']
+    points_list = []
+
+    for chunk in pd.read_csv(config['csv_path'], chunksize=chunksize, usecols=required_columns):
+        chunk['datetime'] = pd.to_datetime(chunk['datetime'])
+        gdf_chunk = gpd.GeoDataFrame(
+            chunk,
+            geometry=gpd.points_from_xy(chunk['lon_pred'], chunk['lat_pred']),
+            crs="EPSG:4326"
+        ).to_crs("EPSG:32644")
+        
+        points_in_core_chunk = gpd.sjoin(gdf_chunk, core_gdf, how='inner', predicate='within')
+        
+        if not points_in_core_chunk.empty:
+            points_list.append(points_in_core_chunk)
+        print(f"Processed {len(chunk)} rows...")
+
+    if not points_list:
+        print(f"Warning: No points found in core zones for {shapefile_name}. Skipping...")
+        continue
+        
+    points_in_core = pd.concat(points_list, ignore_index=True)
+    print(f"\nTotal points in core zones: {len(points_in_core)}")
+
+    # --- 3. Create space-time cube ---
+    print("\n3. Creating space-time cube...")
+
+    # Spatial binning
+    points_in_core['x_bin'] = (points_in_core['utm_e'] / config['spatial_bin_size']).astype(int)
+    points_in_core['y_bin'] = (points_in_core['utm_n'] / config['spatial_bin_size']).astype(int)
+    points_in_core['cell_id'] = points_in_core['x_bin'].astype(str) + "_" + points_in_core['y_bin'].astype(str)
+
+    # Temporal binning
+    temporal_bin_seconds = config['temporal_bin_size'] * 60
+    points_in_core['time_seconds'] = (points_in_core['datetime'] - points_in_core['datetime'].min()).dt.total_seconds()
+    points_in_core['t_bin'] = (points_in_core['time_seconds'] / temporal_bin_seconds).astype(int)
+
+    # Aggregate
+    bin_counts = points_in_core.groupby(['x_bin', 'y_bin', 't_bin']).size().reset_index(name='count')
+
+    # --- 4. Space-time cube visualization ---
+    print("\n4. Creating space-time cube visualization...")
+    fig = plt.figure(figsize=config['space_time_cube_figsize'])
+    ax = fig.add_subplot(111, projection='3d')
+
+    x = bin_counts['x_bin'] * config['spatial_bin_size']
+    y = bin_counts['y_bin'] * config['spatial_bin_size']
+    z = bin_counts['t_bin'] * config['temporal_bin_size'] / 60  # hours
+    counts = bin_counts['count']
+
+    # Nonlinear scaling
+    sizes = np.sqrt(counts) * config['base_point_size']  # Square root scaling with multiplier
+
+    # Dynamic alpha (transparency)
+    max_count = max(counts) if len(counts) > 0 else 1
+    alpha = config['min_alpha'] + (config['max_alpha'] - config['min_alpha']) * (1 - np.log1p(counts)/np.log1p(max_count))
+
+    # Create scatter plot with enhanced visualization parameters
+    sc = ax.scatter(
+        x, y, z,
+        c=np.log1p(counts),  # Color by log(counts)
+        s=sizes,             # Nonlinear sizes
+        cmap=config['colormap'],
+        alpha=alpha,         # Dynamic transparency
+        edgecolor=config['edge_color'],
+        linewidth=config['edge_width']
+    )
+
+    # Add colorbar
+    cbar = plt.colorbar(sc)
+    cbar.set_label('Log(Point Count + 1)')
+
+    # Add size legend
+    for cnt in config['legend_counts']:
+        ax.scatter([], [], [], s=np.sqrt(cnt)*config['base_point_size'], color='gray', label=f'{cnt}')
+
+    ax.legend(
+        title='Point Count',
+        loc='upper right',
+        framealpha=1.0
+    )
+
+    ax.set_xlabel('X Coordinate (m)')
+    ax.set_ylabel('Y Coordinate (m)')
+    ax.set_zlabel('Time (hours)')
+    ax.set_title(f'Space-Time Cube: {shapefile_name}\nSpatial Bin: {config["spatial_bin_size"]}m, Temporal Bin: {config["temporal_bin_size"]}min')
+    ax.grid(True)
+
+    plot_path = os.path.join(output_folder, f"{shapefile_name}_space_time_cube.png")
+    plt.savefig(plot_path, dpi=config['dpi'])
+    plt.close()
+    print(f" - Plot saved to: {plot_path}")
+
+    # --- 5. Prepare space-time cube output ---
+    unique_cells = points_in_core[['x_bin', 'y_bin', 'cell_id']].drop_duplicates()
+    all_t_bins = np.arange(points_in_core['t_bin'].min(), points_in_core['t_bin'].max() + 1)
+
+    space_time_grid = pd.MultiIndex.from_product(
+        [unique_cells['cell_id'], all_t_bins],
+        names=['cell_id', 't_bin']
+    ).to_frame(index=False).merge(unique_cells, on='cell_id', how='left')
+
+    space_time_counts = space_time_grid.merge(
+        bin_counts,
+        on=['x_bin', 'y_bin', 't_bin'],
+        how='left'
+    ).fillna(0)
+
+    # Add coordinates and time ranges
+    space_time_counts['x_utm'] = space_time_counts['x_bin'] * config['spatial_bin_size']
+    space_time_counts['y_utm'] = space_time_counts['y_bin'] * config['spatial_bin_size']
+
+    start_time = points_in_core['datetime'].min()
+    space_time_counts['time_range'] = space_time_counts['t_bin'].apply(
+        lambda x: (
+            start_time + pd.Timedelta(minutes=x*config['temporal_bin_size'])
+        ).strftime('%H:%M:%S') + '-' + (
+            start_time + pd.Timedelta(minutes=(x+1)*config['temporal_bin_size'])
+        ).strftime('%H:%M:%S')
+    )
+
+    # Save space-time cube
+    output_csv = os.path.join(output_folder, f"{shapefile_name}_space_time_cube.csv")
+    space_time_counts[['cell_id', 'x_utm', 'y_utm', 'time_range', 'count']].to_csv(output_csv, index=False)
+    print(f"\nSpace-time cube saved: {output_csv}")
+
+    # --- 6. Temporal pattern analysis ---
+    print("\n6. Analyzing temporal patterns...")
+    df = space_time_counts.copy()
+
+    # Calculate average count per time interval
+    avg_counts = df.groupby('time_range')['count'].mean().reset_index()
+    avg_counts.columns = ['time_range', 'avg_count']
+
+    # Sort chronologically
+    avg_counts['sort_key'] = avg_counts['time_range'].str.split('-').str[0]
+    avg_counts = avg_counts.sort_values('sort_key')
+
+    # Apply smoothing
+    avg_counts['smoothed'] = savgol_filter(
+        avg_counts['avg_count'],
+        window_length=config['smoothing_window'],
+        polyorder=config['smoothing_polyorder']
+    )
+
+    # --- 7. Temporal visualizations ---
+    # Comparison plot
+    plt.figure(figsize=config['figure_size'])
+    plt.plot(avg_counts['time_range'], avg_counts['avg_count'], 
+             marker='o', linestyle='-', color='b', alpha=0.5, label='Original')
+    plt.plot(avg_counts['time_range'], avg_counts['smoothed'], 
+             linewidth=2, color='r', label=f'Smoothed (window={config["smoothing_window"]})')
+    plt.title(f'Activity Patterns for {shapefile_name}')
+    plt.xlabel('Time Interval')
+    plt.ylabel('Average Point Count (per cell)')
+    plt.xticks(rotation=90)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    comp_path = os.path.join(output_folder, f'{shapefile_name}_smoothed_comparison.png')
+    plt.savefig(comp_path, dpi=config['dpi'])
+    plt.close()
+    print(f" - Comparison plot saved: {comp_path}")
+
+    # Smoothed pattern plot
+    plt.figure(figsize=config['figure_size'])
+    plt.plot(avg_counts['time_range'], avg_counts['smoothed'], 
+             marker='o', linestyle='-', color='purple')
+    plt.title(f'Smoothed Activity Pattern for {shapefile_name}')
+    plt.xlabel('Time Interval')
+    plt.ylabel('Average Point Count (per cell)')
+    plt.xticks(rotation=90)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    smooth_path = os.path.join(output_folder, f'{shapefile_name}_smoothed_pattern.png')
+    plt.savefig(smooth_path, dpi=config['dpi'])
+    plt.close()
+    print(f" - Smoothed pattern plot saved: {smooth_path}")
+
+    # Save averages
+    avg_output = os.path.join(output_folder, f'{shapefile_name}_time_averages.csv')
+    avg_counts[['time_range', 'avg_count', 'smoothed']].to_csv(avg_output, index=False)
+    print(f" - Time averages saved: {avg_output}")
+
+    # --- 8. Hourly analysis ---
+    avg_counts['hour'] = avg_counts['time_range'].str.split(':').str[0].astype(int)
+    hourly_avg = avg_counts.groupby('hour')['smoothed'].mean()
+
+    plt.figure(figsize=(10, 5))
+    hourly_avg.plot(kind='bar', color='teal')
+    plt.title(f'Hourly Activity Pattern for {shapefile_name}')
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Average Point Count')
+    plt.xticks(rotation=0)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    hourly_path = os.path.join(output_folder, f'{shapefile_name}_hourly_pattern.png')
+    plt.savefig(hourly_path, dpi=config['dpi'])
+    plt.close()
+    print(f" - Hourly pattern plot saved: {hourly_path}")
+
+    # --- 9. Print summary ---
+    print("\nAnalysis Summary:")
+    print(f"Total points: {len(points_in_core)}")
+    print(f"Unique spatial cells: {len(points_in_core[['x_bin', 'y_bin']].drop_duplicates())}")
+    print(f"Time duration: {points_in_core['datetime'].max() - points_in_core['datetime'].min()}")
+    print(f"Temporal bins: {points_in_core['t_bin'].nunique()}")
+
+    top_periods = avg_counts.nlargest(5, 'smoothed')
+    print("\nTop 5 most active time intervals (smoothed):")
+    print(top_periods[['time_range', 'smoothed']])
+
+print(f"\n{'='*50}\nAll processing complete!\nOutputs saved to respective folders in: {config['output_base_folder']}")
