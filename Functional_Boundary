@@ -1,0 +1,335 @@
+import os
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+from shapely.geometry import Point, Polygon
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+
+# Configuration
+DATA_CSV_PATH = r"filtered_Position csv file location"
+URBAN_SHAPEFILE_PATH = r"City_centre of urban areas shp file location"
+OUTPUT_DIR = r"output file location"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Dynamic Buffer Parameters
+MIN_BUFFER = 300       # Smallest buffer for tiny towns (meters)
+MAX_BUFFER = 3000      # Largest allowed buffer (meters)
+BUFFER_STEP = 100      # Expansion increment (meters)
+TEMPORAL_THRESHOLD = 0.65  # Minimum ratio of temporal zones to continue expansion
+DENSITY_FALLOFF = 0.7  # Stop if density drops below 70% of max observed density
+
+# Time Period Definitions
+DAY_HOURS = list(range(6, 19))    # 6AM-6PM
+NIGHT_HOURS = [22, 23, 0, 1, 2, 3, 4, 5]  # 10PM-5AM
+
+# Zone color scheme
+ZONE_COLORS = {
+    'core': '#e41a1c',        # Red
+    'commuter': '#377eb8',    # Blue
+    'residential': '#4daf4a', # Green
+    'no significant activity': '#f0f0f0' # Light gray
+}
+
+def classify_zones(points_gdf, grid):
+    """Classify grid cells into functional zones based on temporal patterns."""
+    try:
+        joined = gpd.sjoin(points_gdf, grid, how='left', predicate='within')
+        
+        hourly_counts = joined.groupby(['cell_id','hour']).size().reset_index(name='count')
+        counts_matrix = hourly_counts.pivot(index='cell_id', columns='hour', values='count').fillna(0)
+        
+        # Ensure all hour columns exist
+        for h in DAY_HOURS + NIGHT_HOURS:
+            if h not in counts_matrix.columns:
+                counts_matrix[h] = 0
+                
+        # Calculate temporal metrics
+        counts_matrix['day_avg'] = counts_matrix[DAY_HOURS].mean(axis=1)
+        counts_matrix['night_avg'] = counts_matrix[NIGHT_HOURS].mean(axis=1)
+        counts_matrix['peak'] = counts_matrix.max(axis=1)
+        
+        # Dynamic peak threshold
+        peak_threshold = 0.1 * counts_matrix['peak'].quantile(0.95)
+        
+        # Zone classification
+        conditions = [
+            (counts_matrix['peak'] >= peak_threshold),
+            (counts_matrix['day_avg'] > 2*counts_matrix['night_avg']),
+            (counts_matrix['night_avg'] > 1.5*counts_matrix['day_avg'])
+        ]
+        choices = ['core', 'commuter', 'residential']
+        counts_matrix['zone'] = np.select(conditions, choices, default='no significant activity')
+        
+        return counts_matrix['zone']
+    except Exception as e:
+        print(f"Error in zone classification: {str(e)}")
+        # Return default classification
+        return pd.Series(['no significant activity'] * len(grid), index=grid['cell_id'])
+
+def create_grid(bounds, padding=2000, cell_size=100):
+    """Create analysis grid with padding around bounds."""
+    x_grid = np.arange(
+        np.floor((bounds[0]-padding)/cell_size)*cell_size,
+        np.ceil((bounds[2]+padding)/cell_size)*cell_size,
+        cell_size
+    )
+    y_grid = np.arange(
+        np.floor((bounds[1]-padding)/cell_size)*cell_size,
+        np.ceil((bounds[3]+padding)/cell_size)*cell_size,
+        cell_size
+    )
+    
+    grid_cells = [
+        Polygon([(x,y), (x+cell_size,y), (x+cell_size,y+cell_size), (x,y+cell_size)]) 
+        for x in x_grid for y in y_grid
+    ]
+    
+    grid = gpd.GeoDataFrame(geometry=grid_cells, crs="EPSG:32644")
+    grid['cell_id'] = [f"{int(x)}_{int(y)}" for x in x_grid for y in y_grid]
+    return grid
+
+def filter_csv_by_geometry(csv_path, target_geometry, crs, chunksize=100000):
+    """Filter a large CSV to only include points within a geometry using chunking."""
+    filtered_chunks = []
+    
+    # First pass: get rough bounds to filter chunks more efficiently
+    minx, miny, maxx, maxy = target_geometry.bounds
+    bounds_filter = (
+        f"utm_e >= {minx - 5000} and utm_e <= {maxx + 5000} and "
+        f"utm_n >= {miny - 5000} and utm_n <= {maxy + 5000}"
+    )
+    
+    for chunk in pd.read_csv(csv_path, chunksize=chunksize):
+        # Rough spatial filter first
+        chunk = chunk.query(bounds_filter)
+        if len(chunk) == 0:
+            continue
+            
+        # Convert to GeoDataFrame for precise filtering
+        point_geometry = [Point(xy) for xy in zip(chunk['utm_e'], chunk['utm_n'])]
+        chunk_gdf = gpd.GeoDataFrame(chunk, geometry=point_geometry, crs=crs)
+        chunk_gdf = chunk_gdf[chunk_gdf.intersects(target_geometry)]
+        
+        if len(chunk_gdf) > 0:
+            filtered_chunks.append(chunk_gdf.drop(columns=['geometry']))
+    
+    if not filtered_chunks:
+        return pd.DataFrame()
+    
+    filtered_df = pd.concat(filtered_chunks)
+    filtered_df['datetime'] = pd.to_datetime(filtered_df['datetime'], errors='coerce')
+    filtered_df['hour'] = filtered_df['datetime'].dt.hour
+    return filtered_df
+
+# Load urban centers
+print("Loading urban centers...")
+urban_centers = gpd.read_file(URBAN_SHAPEFILE_PATH)
+if urban_centers.crs is None:
+    urban_centers.crs = "EPSG:4326"
+urban_centers = urban_centers.to_crs("EPSG:32644")
+
+# Initialize reporting variables
+processed_cities = []
+skipped_cities = []
+report_data = []
+
+# Process each city
+for idx, city in urban_centers.iterrows():
+    city_name = city.get('name', f'City_{idx+1}')
+    print(f"\nProcessing {city_name}")
+    
+    try:
+        # Step 1: Filter CSV data for this city's initial buffer area
+        initial_buffer = city.geometry.buffer(MAX_BUFFER + 2000)  # Add padding
+        print(f"Filtering CSV data for {city_name}...")
+        city_df = filter_csv_by_geometry(DATA_CSV_PATH, initial_buffer, "EPSG:32644")
+        
+        if len(city_df) == 0:
+            print(f"No data found for {city_name}, skipping...")
+            skipped_cities.append((city_name, "No data points found"))
+            continue
+        
+        # Convert to GeoDataFrame
+        geometry = [Point(xy) for xy in zip(city_df['utm_e'], city_df['utm_n'])]
+        point_gdf = gpd.GeoDataFrame(city_df, geometry=geometry, crs="EPSG:32644")
+        
+        current_buffer = MIN_BUFFER
+        functional_buffer = MIN_BUFFER
+        max_density = 0
+        historical_ratios = []
+        
+        # Dynamic buffer expansion loop
+        while current_buffer <= MAX_BUFFER:
+            buffer_zone = city.geometry.buffer(current_buffer)
+            points_in_buffer = point_gdf[point_gdf.intersects(buffer_zone)]
+            
+            # Calculate point density (points/km²)
+            buffer_area_km2 = (buffer_zone.area / 1e6) if buffer_zone.area > 0 else 1e-6
+            current_density = len(points_in_buffer) / buffer_area_km2
+            max_density = max(max_density, current_density)
+            
+            # Skip if too few points
+            if len(points_in_buffer) < 20:
+                print(f"Stopping: Insufficient points at {current_buffer}m")
+                break
+                
+            # Create analysis grid
+            grid = create_grid(buffer_zone.bounds)
+            
+            # Classify zones
+            zones = classify_zones(points_in_buffer, grid)
+            temporal_ratio = (zones.isin(['core', 'commuter', 'residential'])).mean()
+            historical_ratios.append(temporal_ratio)
+            
+            print(
+                f"Buffer {current_buffer}m: "
+                f"Temporal ratio = {temporal_ratio:.2f}, "
+                f"Density = {current_density:.1f} pts/km²"
+            )
+            
+            # Stopping conditions
+            if (temporal_ratio < TEMPORAL_THRESHOLD) or \
+               (current_density < DENSITY_FALLOFF * max_density):
+                functional_buffer = current_buffer
+                break
+                
+            current_buffer += BUFFER_STEP
+        
+        # Final processing with optimal buffer
+        final_buffer = city.geometry.buffer(functional_buffer)
+        final_points = point_gdf[point_gdf.intersects(final_buffer)]
+        final_grid = create_grid(final_buffer.bounds)
+        
+        # Final classification
+        final_zones = classify_zones(final_points, final_grid)
+        final_grid = final_grid.merge(
+            final_zones.rename('zone'), 
+            left_on='cell_id', 
+            right_index=True, 
+            how='left'
+        )
+        final_grid['zone'] = final_grid['zone'].fillna('no significant activity')
+        
+        # Filter to keep only core, commuter, and residential cells
+        final_grid = final_grid[final_grid['zone'].isin(['core', 'commuter', 'residential'])]
+        
+        # Count functional cells
+        functional_cell_count = len(final_grid)
+        
+        # Visualization
+        fig, ax = plt.subplots(figsize=(12, 12))
+        
+        # Plot zones
+        final_grid.plot(
+            column='zone',
+            ax=ax,
+            categorical=True,
+            cmap=ListedColormap([ZONE_COLORS[z] for z in ['core', 'commuter', 'residential']]),
+            legend=True,
+            edgecolor='k',
+            linewidth=0.2,
+            legend_kwds={
+                'title': 'Functional Zones',
+                'loc': 'upper right',
+                'bbox_to_anchor': (1, 1)
+            }
+        )
+        
+        # Add contextual elements
+        urban_centers.iloc[[idx]].plot(
+            ax=ax, 
+            color='black', 
+            markersize=200, 
+            marker='*',
+            label='City Center'
+        )
+        gpd.GeoSeries([final_buffer.boundary]).plot(
+            ax=ax, 
+            color='k', 
+            linewidth=2, 
+            linestyle='--',
+            label=f'Functional Boundary ({functional_buffer}m)'
+        )
+        
+        # Add scale bar
+        scale_length = 500  # meters
+        x_pos = final_grid.bounds.minx.values[0] + 100
+        y_pos = final_grid.bounds.miny.values[0] + 100
+        ax.plot([x_pos, x_pos + scale_length], [y_pos, y_pos], color='k', linewidth=3)
+        ax.text(x_pos + scale_length/2, y_pos + 50, f'{scale_length}m', ha='center')
+        
+        # Customize plot
+        ax.set_title(
+            f"{city_name}\n"
+            f"Functional Zones | Buffer: {functional_buffer}m | Cells: {functional_cell_count}\n"
+            f"Temporal Ratio: {historical_ratios[-1]:.2f}",
+            fontsize=14,
+            pad=20
+        )
+        ax.legend(loc='lower left')
+        ax.set_axis_off()
+        
+        # Save and show
+        plt.tight_layout()
+        output_path = os.path.join(OUTPUT_DIR, f"{city_name}_functional_zones.png")
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Saved visualization to {output_path}")
+        plt.close()
+        
+        # Save shapefile (only with core, commuter, and residential zones)
+        shp_path = os.path.join(OUTPUT_DIR, f"{city_name}_zones.shp")
+        final_grid.to_file(shp_path)
+        print(f"Saved shapefile to {shp_path}")
+        
+        # Add to processed cities report
+        processed_cities.append(city_name)
+        report_data.append({
+            'City': city_name,
+            'Functional Buffer (m)': functional_buffer,
+            'Functional Cells Count': functional_cell_count,
+            'Temporal Ratio': historical_ratios[-1] if historical_ratios else 0,
+            'Status': 'Success'
+        })
+        
+        # Explicitly clean up memory
+        del city_df, point_gdf, final_points, final_grid
+        import gc
+        gc.collect()
+        
+    except Exception as e:
+        print(f"Error processing {city_name}: {str(e)}")
+        skipped_cities.append((city_name, str(e)))
+        report_data.append({
+            'City': city_name,
+            'Functional Buffer (m)': 0,
+            'Functional Cells Count': 0,
+            'Temporal Ratio': 0,
+            'Status': f'Error: {str(e)}'
+        })
+        continue
+
+# Generate final report
+print("\nProcessing complete! Generating report...")
+
+# Create report DataFrame
+report_df = pd.DataFrame(report_data)
+
+# Save report to CSV
+report_path = os.path.join(OUTPUT_DIR, "processing_report.csv")
+report_df.to_csv(report_path, index=False)
+print(f"Saved processing report to {report_path}")
+
+# Print summary to console
+print("\n=== Processing Summary ===")
+print(f"Total cities processed: {len(processed_cities)}")
+print(f"Total cities skipped: {len(skipped_cities)}")
+if skipped_cities:
+    print("\nSkipped cities with reasons:")
+    for city, reason in skipped_cities:
+        print(f"- {city}: {reason}")
+
+print("\n=== Functional Boundary Statistics ===")
+print(report_df[['City', 'Functional Buffer (m)', 'Functional Cells Count', 'Temporal Ratio', 'Status']].to_string(index=False))
+
+print("\nAll done!")
